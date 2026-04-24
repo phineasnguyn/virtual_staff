@@ -1,33 +1,13 @@
-import mysql.connector
 import random
-
-# --- CẤU HÌNH HỆ THỐNG ---
-DB_CONFIG = {
-    'host': 'localhost',
-    'user': 'root',
-    'password': '',
-    'database': 'hospital_rag_db'
-}
+from db_pipeline_modules.db_utils import init_services_db, get_db_connection
 
 def create_and_seed_services_table():
-    try:
-        conn = mysql.connector.connect(**DB_CONFIG)
-        cursor = conn.cursor()
+    # 1. Khởi tạo Database và Bảng từ db_utils
+    db_config = init_services_db()
 
-        print("Đang kiểm tra và cập nhật cấu trúc bảng 'hospital_services'...")
-        cursor.execute("""
-        CREATE TABLE IF NOT EXISTS hospital_services (
-            service_id VARCHAR(20) PRIMARY KEY,
-            service_name VARCHAR(255) NOT NULL,
-            department VARCHAR(100),
-            room VARCHAR(100),
-            est_duration_mins INT,
-            current_wait_time_mins INT,
-            machine_processing_time INT DEFAULT 0,
-            medical_rule TEXT
-        ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-        """)
-
+    # 2. Kết nối an toàn qua Context Manager để nạp dữ liệu
+    print("Đang nạp dữ liệu và làm mới thời gian chờ ngẫu nhiên...")
+    with get_db_connection(db_config) as (conn, cursor):
         # --- DỮ LIỆU GIẢ LẬP ĐẦY ĐỦ CÁC CHUYÊN KHOA ---
         fake_data = [
             # ================= CẬN LÂM SÀNG (XÉT NGHIỆM) =================
@@ -70,13 +50,6 @@ def create_and_seed_services_table():
         conn.commit()
         
         print(f"=== HOÀN TẤT! Đã nạp thành công {cursor.rowcount} dịch vụ vào SQL ===")
-
-    except mysql.connector.Error as err:
-        print(f"Lỗi MySQL: {err}")
-    finally:
-        if 'conn' in locals() and conn.is_connected():
-            cursor.close()
-            conn.close()
 
 if __name__ == "__main__":
     create_and_seed_services_table()

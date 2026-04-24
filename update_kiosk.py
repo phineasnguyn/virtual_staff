@@ -1,6 +1,7 @@
 import asyncio
 import os
 import re
+import threading
 import time
 from dotenv import load_dotenv
 
@@ -14,6 +15,7 @@ from virtual_staff_brain_3_0 import (
     process_patient_query,
     fetch_patient_record,
     reset_brain_memory,
+    quick_route,
 )
 
 # ====================================================================
@@ -96,8 +98,8 @@ def smart_split(text: str, max_len: int = 150):
 # ====================================================================
 
 class KioskBrainStream(llm.LLMStream):
-    # [1] THÊM THAM SỐ brain_lock ĐỂ NHẬN CHÌA KHÓA
-    def __init__(self, user_text, record_text, llm_instance, chat_ctx, conn_options=None, tools=None, is_duplicate=False, brain_lock=None):
+    # CHÚ Ý: Đã thêm tham số is_duplicate
+    def __init__(self, user_text, record_text, llm_instance, chat_ctx, conn_options=None, tools=None, is_duplicate=False):
         super().__init__(
             llm=llm_instance, 
             chat_ctx=chat_ctx, 
@@ -107,71 +109,85 @@ class KioskBrainStream(llm.LLMStream):
         self.user_text = user_text
         self.record_text = record_text
         self.llm_instance = llm_instance
+        self.is_duplicate = is_duplicate
         self._queue = asyncio.Queue(maxsize=20)
         self._started = False
-        self.is_duplicate = is_duplicate
-        self.brain_lock = brain_lock # Cầm chìa khóa
+        self._run_called = False
 
     async def _run(self):
+        if getattr(self, '_run_called', False):
+            return
+        self._run_called = True
+
+        sid = id(self) % 10000  # ID ngắn để nhận biết luồng xử lý
+        print(f"[RUN-{sid}] BẮT ĐẦU: trùng_lặp={self.is_duplicate} nội_dung='{self.user_text[:30]}'")
         try:
             if self.is_duplicate:
+                print(f"[RUN-{sid}] THOÁT: Phát hiện luồng trùng lặp (is_duplicate=True)")
                 await self._queue.put(None)
                 return
 
-            # [2] KIỂM TRA KHÓA: Nếu khóa tồn tại và đang bị đóng
-            if self.brain_lock and self.brain_lock.locked():
-                print(f"🚫 [CỬA ĐÓNG] AI đang bận, chặn mảnh vỡ: '{self.user_text}'")
-                await self._queue.put(None)
+            if not self.user_text.strip():
+                fallback = humanize(ensure_tts_safe("Dạ cháu nghe chưa rõ, cô chú lặp lại giúp cháu với ạ."))
+                await self._queue.put(fallback)
                 return
 
-            # [3] KHÓA CỬA LẠI ĐỂ TẬP TRUNG SUY NGHĨ
-            async with self.brain_lock:
-                print(f"Processing: {self.user_text}")
+            _fast = quick_route(self.user_text)
 
-                if not self.user_text.strip():
-                    fallback = humanize(ensure_tts_safe("Dạ cháu nghe chưa rõ, cô chú lặp lại giúp cháu với ạ."))
-                    await self._queue.put(fallback)
-                    return
+            try:
+                response = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        process_patient_query,
+                        self.user_text,
+                        self.record_text,
+                    ),
+                    timeout=360,
+                )
+            except asyncio.TimeoutError:
+                print(f"[RUN-{sid}] LỖI: Hết thời gian chờ (Timeout)")
+                response = FALLBACK_RESPONSE
+            except asyncio.CancelledError:
+                print(f"[RUN-{sid}] HỦY: Tiến trình bị hủy trong lúc xử lý LLM!")
+                raise
 
-                try:
-                    response = await asyncio.wait_for(
-                        asyncio.to_thread(
-                            process_patient_query,
-                            self.user_text,
-                            self.record_text,
-                        ),
-                        timeout=150,
-                    )
-                except asyncio.TimeoutError:
-                    print("Timeout error: Máy tính đang bận, cô chú vui lòng thử lại sau ạ.")
-                    response = FALLBACK_RESPONSE
+            print(f"[RUN-{sid}] Kết quả trả về='{(response or '')[:60]}'")
 
-                print(f"Raw response: {response}")
+            if not response or not response.strip():
+                print(f"[RUN-{sid}] THOÁT: Không có nội dung trả về")
+                return
 
-                chunks = smart_split(response)
-                valid_chunks = []
+            chunks = smart_split(response)
+            print(f"[RUN-{sid}] Chia thành {len(chunks)} đoạn: {[c[:25] for c in chunks]}")
+            valid_chunks = []
 
-                for chunk in chunks:
-                    safe = ensure_tts_safe(chunk)
-                    safe = humanize(safe)
-                    if safe and len(safe.strip()) > 3:
-                        valid_chunks.append(safe)
+            for chunk in chunks:
+                safe = ensure_tts_safe(chunk)
+                safe = humanize(safe)
+                if safe and len(safe.strip()) > 3:
+                    valid_chunks.append(safe)
 
-                if not valid_chunks:
-                    fallback = humanize(ensure_tts_safe(FALLBACK_RESPONSE))
-                    valid_chunks = [fallback]
+            if not valid_chunks:
+                fallback = humanize(ensure_tts_safe(FALLBACK_RESPONSE))
+                valid_chunks = [fallback]
+                print(f"[RUN-{sid}] CẢNH BÁO: Phải dùng câu trả lời dự phòng (fallback)")
 
-                for chunk in valid_chunks:
-                    print(f"Pushing to TTS: {chunk}")
-                    await self._queue.put(chunk)
+            for chunk in valid_chunks:
+                print(f"[RUN-{sid}] Đưa vào hàng đợi phát âm: '{chunk[:40]}'")
+                await self._queue.put(chunk)
 
+        except asyncio.CancelledError:
+            print(f"[RUN-{sid}] HỦY: Tiến trình bị hủy (vòng ngoài)!")
+            raise
         except Exception as e:
-            print(f"System Error: {e}")
+            print(f"[RUN-{sid}] LỖI HỆ THỐNG: {e}")
             fallback = humanize(ensure_tts_safe(FALLBACK_RESPONSE))
             await self._queue.put(fallback)
 
         finally:
+            print(f"[RUN-{sid}] HOÀN TẤT → Kết thúc hàng đợi")
             await self._queue.put(None)
+            if not self.is_duplicate:
+                self.llm_instance.mark_done()
 
     async def __anext__(self) -> llm.ChatChunk:
         if not self._started:
@@ -194,8 +210,14 @@ class KioskBrainLLM(llm.LLM):
         self.record_text = ""
         self.last_processed_text = ""
         self.last_call_time = 0
-        # [4] LẮP Ổ KHÓA TRỰC TIẾP VÀO BỘ NÃO
-        self.brain_lock = asyncio.Lock() 
+        self._dedup_lock = threading.Lock()
+        self._is_processing = False  # Cờ đang xử lý request
+
+    def mark_done(self):
+        """Gọi khi _run() hoàn thành — refresh cooldown từ lúc response được giao."""
+        with self._dedup_lock:
+            self._is_processing = False
+            self.last_call_time = time.time()  # Cửa sổ 20s bắt đầu lại từ đây
 
     def set_record_context(self, text):
         self.record_text = text
@@ -207,7 +229,14 @@ class KioskBrainLLM(llm.LLM):
             else chat_ctx.messages
         )
 
-        user_msg = msgs[-1].content if msgs else ""
+        # Tìm tin nhắn NGƯỜI DÙNG cuối cùng (role=user)
+        user_msg = ""
+        for msg in reversed(msgs):
+            if getattr(msg, "role", None) == "user":
+                user_msg = msg.content
+                break
+        if not user_msg:
+            user_msg = msgs[-1].content if msgs else ""
 
         if isinstance(user_msg, list):
             user_text = " ".join([getattr(m, "text", str(m)) for m in user_msg])
@@ -216,15 +245,33 @@ class KioskBrainLLM(llm.LLM):
 
         cleaned_text = re.sub(r'[^\w\s]', '', user_text).strip().lower()
         current_time = time.time()
-        
         is_dup = False
-        
-        if (cleaned_text == self.last_processed_text and cleaned_text != "") or (current_time - self.last_call_time < 1.5):
-            is_dup = True
-            print(f"🚫 [BỘ LỌC] Đã chặn luồng dội âm: '{user_text}'")
-        else:
-            self.last_processed_text = cleaned_text
-            self.last_call_time = current_time
+
+        # DEBUG: hiển thị mọi lần chat() được gọi để phát hiện lần gọi thừa
+        elapsed_now = current_time - self.last_call_time
+        print(f"[CHAT] t+{elapsed_now:.1f}s | last='{self.last_processed_text[:30]}' | new='{cleaned_text[:30]}' | processing={self._is_processing}")
+
+        with self._dedup_lock:
+            SAME_COOLDOWN = 20  # Chặn cùng câu hỏi trong 20s kể từ lúc bắt đầu xử lý
+            elapsed = current_time - self.last_call_time
+
+            same_recently = (
+                cleaned_text == self.last_processed_text
+                and cleaned_text != ""
+                and elapsed < SAME_COOLDOWN
+            )
+            too_fast = (elapsed < 2.0)
+
+            if same_recently:
+                is_dup = True
+                print(f"[BỘ LỌC] Chặn xử lý trùng nội dung sau {elapsed:.1f}s: '{user_text[:50]}'")
+            elif too_fast:
+                is_dup = True
+                print(f"[BỘ LỌC] Chặn dội âm (Echo) {elapsed:.2f}s: '{user_text[:50]}'")
+            else:
+                self.last_processed_text = cleaned_text
+                self.last_call_time = current_time
+                self._is_processing = True
 
         return KioskBrainStream(
             user_text=user_text,
@@ -233,9 +280,7 @@ class KioskBrainLLM(llm.LLM):
             chat_ctx=chat_ctx,
             tools=tools,
             conn_options=conn_options,
-            is_duplicate=is_dup,
-            # [5] TRUYỀN CHÌA KHÓA SANG CHO LUỒNG XỬ LÝ
-            brain_lock=self.brain_lock 
+            is_duplicate=is_dup
         )
 # ====================================================================
 # [2] MAIN
@@ -253,7 +298,7 @@ async def entrypoint(ctx: JobContext):
     reset_brain_memory()
     #record = fetch_patient_record("bn-001")
     
-    patient_id = "bn-004"
+    patient_id = "bn-008"
 
 
     # Phao cứu sinh: Nếu quên nhập hoặc lỗi, tự động xài BN-001
@@ -261,9 +306,10 @@ async def entrypoint(ctx: JobContext):
     
     record = fetch_patient_record(patient_id)
     
-    print(" HỒ SƠ BỆNH NHÂN ĐANG TIẾP NHẬN:")
+    print(f"[KHOI DONG] Ho so benh nhan [{patient_id}]:")
     print("-" * 40)
-    print(record)
+    print(record.strip())
+    print("-" * 40)
 
     llm_instance = KioskBrainLLM()
     llm_instance.set_record_context(record)
@@ -296,13 +342,13 @@ async def entrypoint(ctx: JobContext):
     
     @session.on("user_started_speaking")
     def on_start():
-        print(" VAD: Đã phát hiện tiếng động! (Đang đợi bạn nói xong...)")
+        pass  # Im lặng — log sẽ xuất hiện khi có phản hồi hoàn chỉnh
     
     @session.on("user_speech_committed")
     def on_speech_committed(msg):
-        print(f"[DEEPGRAM VỪA NGHE ĐƯỢC]: {msg.content}")
+        print(f"\n[STT] {msg.content}")
 
-    print("System ready.")
+    print("[HE THONG SAN SANG]")
     await session.start(room=ctx.room, agent=agent)
 
 def prewarm(proc):
