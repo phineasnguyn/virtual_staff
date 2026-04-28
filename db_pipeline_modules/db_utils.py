@@ -81,7 +81,23 @@ def init_services_db():
         est_duration_mins INT,
         current_wait_time_mins INT,
         machine_processing_time INT DEFAULT 0,
-        medical_rule TEXT
+        medical_rule TEXT,
+        map_image_url VARCHAR(255)
+    ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+    """)
+
+    try:
+        cursor.execute("ALTER TABLE hospital_services ADD COLUMN map_image_url VARCHAR(255);")
+    except Exception:
+        pass  # Bỏ qua nếu cột đã tồn tại
+
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS patient_queue (
+        queue_id INT AUTO_INCREMENT PRIMARY KEY,
+        patient_id VARCHAR(50),
+        service_id VARCHAR(50),
+        status ENUM('WAITING', 'IN_PROGRESS', 'DONE') DEFAULT 'WAITING',
+        checkin_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
     """)
     conn.commit()

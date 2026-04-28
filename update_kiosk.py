@@ -97,6 +97,41 @@ def smart_split(text: str, max_len: int = 150):
 # [1] LLM STREAM (TƯƠNG THÍCH TUYỆT ĐỐI LIVEKIT v1.5.2+)
 # ====================================================================
 
+def extract_patient_intent(text: str) -> dict | None:
+    """Trả về {'type': 'id', 'value': 'bn-008'} hoặc {'type': 'guest'} hoặc None"""
+    text_lower = text.lower()
+    
+    # Check khách vãng lai
+    guest_keywords = ["không nhớ", "không có", "quên", "vãng lai", "lần đầu", "khách mới", "không biết"]
+    if any(kw in text_lower for kw in guest_keywords):
+        return {"type": "guest"}
+    
+    import re
+    # Xử lý trường hợp STT dịch số thành chữ (VD: "tám", "không không tám")
+    word_to_num = {
+        "không": "0", "một": "1", "hai": "2", "ba": "3", "bốn": "4",
+        "năm": "5", "sáu": "6", "bảy": "7", "tám": "8", "chín": "9", "mười": "10"
+    }
+    
+    converted = text_lower
+    for w, n in word_to_num.items():
+        converted = re.sub(rf'\b{w}\b', n, converted)
+        
+    # Gom các số rời rạc lại với nhau (VD: "0 0 8" -> "008")
+    converted = re.sub(r'(?<=\d)\s+(?=\d)', '', converted)
+    
+    # Check mã số
+    numbers = re.findall(r'\d+', converted)
+    if numbers:
+        # Lấy dãy số đầu tiên
+        num_str = numbers[0]
+        # Bù thêm số 0 cho đủ 3 chữ số nếu cần (VD: "8" -> "008")
+        if len(num_str) < 3:
+            num_str = num_str.zfill(3)
+        return {"type": "id", "value": f"bn-{num_str}"}
+        
+    return None
+
 class KioskBrainStream(llm.LLMStream):
     # CHÚ Ý: Đã thêm tham số is_duplicate
     def __init__(self, user_text, record_text, llm_instance, chat_ctx, conn_options=None, tools=None, is_duplicate=False):
@@ -131,6 +166,26 @@ class KioskBrainStream(llm.LLMStream):
                 fallback = humanize(ensure_tts_safe("Dạ cháu nghe chưa rõ, cô chú lặp lại giúp cháu với ạ."))
                 await self._queue.put(fallback)
                 return
+
+            # [CHẶN] Nếu chưa xác thực mã bệnh nhân
+            if not self.llm_instance.patient_id_verified:
+                intent = extract_patient_intent(self.user_text)
+                if intent and intent["type"] == "guest":
+                    self.llm_instance.set_record_context("Hồ sơ Bệnh nhân: Khách vãng lai. Không có dữ liệu bệnh nền.")
+                    self.llm_instance.patient_id_verified = True
+                    await self._queue.put("Dạ cháu đã đăng ký cô chú là khách vãng lai. Hôm nay cô chú đến khám có triệu chứng gì ạ?")
+                elif intent and intent["type"] == "id":
+                    record = fetch_patient_record(intent["value"])
+                    if record and "không tìm thấy" not in record.lower():
+                        self.llm_instance.set_record_context(record)
+                        self.llm_instance.patient_id_verified = True
+                        await self._queue.put(f"Dạ cháu đã tìm thấy hồ sơ mã {intent['value']}. Hôm nay cô chú thấy trong người thế nào ạ?")
+                    else:
+                        await self._queue.put(f"Dạ cháu không tìm thấy hồ sơ mang mã {intent['value']}. Cô chú đọc lại giúp cháu, hoặc nói 'không nhớ' để khám vãng lai nhé.")
+                else:
+                    await self._queue.put("Dạ cô chú vui lòng đọc mã bệnh nhân, hoặc nói 'không nhớ' để cháu đăng ký khám vãng lai ạ.")
+                
+                return # Dừng ở đây, không gọi LLM để xử lý câu hỏi triệu chứng
 
             _fast = quick_route(self.user_text)
 
@@ -212,6 +267,7 @@ class KioskBrainLLM(llm.LLM):
         self.last_call_time = 0
         self._dedup_lock = threading.Lock()
         self._is_processing = False  # Cờ đang xử lý request
+        self.patient_id_verified = False # Cờ xác nhận đã có mã bệnh nhân
 
     def mark_done(self):
         """Gọi khi _run() hoàn thành — refresh cooldown từ lúc response được giao."""
@@ -296,23 +352,11 @@ async def entrypoint(ctx: JobContext):
     await ctx.connect(auto_subscribe=agents.AutoSubscribe.AUDIO_ONLY)
 
     reset_brain_memory()
-    #record = fetch_patient_record("bn-001")
     
-    patient_id = "bn-008"
-
-
-    # Phao cứu sinh: Nếu quên nhập hoặc lỗi, tự động xài BN-001
-
-    
-    record = fetch_patient_record(patient_id)
-    
-    print(f"[KHOI DONG] Ho so benh nhan [{patient_id}]:")
-    print("-" * 40)
-    print(record.strip())
-    print("-" * 40)
+    print("[KHOI DONG] Đang chờ bệnh nhân cung cấp mã...")
 
     llm_instance = KioskBrainLLM()
-    llm_instance.set_record_context(record)
+    # Không set context lúc này, LLM sẽ tự động hỏi khi patient_id_verified = False
 
     # Khởi tạo STT bằng Deepgram (Tai thính nhất)
     stt = deepgram.STT(language="vi", model="nova-2")

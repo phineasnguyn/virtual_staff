@@ -105,6 +105,7 @@ REWRITE_PROMPT = PromptTemplate(
 # Cấu trúc từng bước di chuyển
 class RouteStep(BaseModel):
     step_order: int = Field(description="Thứ tự bước đi (1, 2, 3...)")
+    service_id: str = Field(description="Mã dịch vụ (VD: CLINIC_GASTRO, TEST_BLOOD)")
     service_name: str = Field(description="Tên dịch vụ/xét nghiệm")
     room: str = Field(description="Số phòng và tầng")
     reasoning: str = Field(description="Lý do xếp bước này ở vị trí hiện tại")
@@ -208,7 +209,7 @@ def fetch_live_services_from_mysql():
     conn = service_pool.get_connection()
     try:
         cursor = conn.cursor(dictionary=True)
-        cursor.execute("SELECT service_name, room, current_wait_time_mins, medical_rule FROM hospital_services")
+        cursor.execute("SELECT service_id, service_name, room, current_wait_time_mins, medical_rule, map_image_url FROM hospital_services")
         services = cursor.fetchall()
     finally:
         cursor.close()
@@ -216,9 +217,30 @@ def fetch_live_services_from_mysql():
 
     # Định dạng thành chuỗi văn bản để nhét vào Prompt
     services_text = ""
+    map_urls = {}
     for s in services:
-        services_text += f"- Dịch vụ: {s['service_name']} | Phòng: {s['room']} | Chờ: {s['current_wait_time_mins']} phút | Quy tắc: {s['medical_rule']}\n"
-    return services_text
+        services_text += f"- Mã: {s['service_id']} | Dịch vụ: {s['service_name']} | Phòng: {s['room']} | Chờ: {s['current_wait_time_mins']} phút | Quy tắc: {s['medical_rule']}\n"
+        map_urls[s['service_id']] = s.get('map_image_url', '')
+    return services_text, map_urls
+
+def register_patient_to_queue(patient_id: str, service_id: str):
+    """Đẩy bệnh nhân vào bảng patient_queue của dịch vụ"""
+    if not patient_id:
+        patient_id = "KHACH_MOI"
+    conn = service_pool.get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO patient_queue (patient_id, service_id, status) VALUES (%s, %s, %s)",
+            (patient_id, service_id, 'WAITING')
+        )
+        conn.commit()
+        print(f"\n[HỆ THỐNG] Đã check-in thành công bệnh nhân {patient_id} vào hàng đợi dịch vụ {service_id}")
+    except Exception as e:
+        print(f"[LỖI CHECK-IN] {e}")
+    finally:
+        cursor.close()
+        conn.close()
 
 # Hàm truy xuất hồ sơ bệnh án từ SQL dựa trên patient_id (nếu có)
 def fetch_patient_record(patient_id: str) -> str:
@@ -309,8 +331,10 @@ def quick_route(raw_query: str) -> str | None:
     - None  → cần gọi LLM (đủ context hoặc query lạ)
     - str   → câu hỏi pre-coded (thiếu context)
     """
-    # Không áp dụng Fast Path nếu đang trong giữa cuộc hội thoại để tránh phá vỡ luồng hỏi đáp của LLM!
-    if len(chat_history) > 0:
+    # Không áp dụng Fast Path nếu đang trong giữa cuộc hội thoại (đã có HumanMessage trước đó)
+    with _history_lock:
+        human_msgs_count = sum(1 for m in chat_history if isinstance(m, HumanMessage))
+    if human_msgs_count > 0:
         return None
 
     q = raw_query.lower().strip()
@@ -339,7 +363,7 @@ def _evict_expired_cache() -> None:
             _query_pending.pop(k, None)
 
 
-def process_patient_query(raw_query: str, patient_record_text: str = "") -> str:
+def process_patient_query(raw_query: str, patient_record_text: str = "", patient_id: str = "") -> str:
     cache_key = re.sub(r'[^\w]', '', raw_query).strip().lower()
     now = time.time()
 
@@ -545,7 +569,14 @@ def process_patient_query(raw_query: str, patient_record_text: str = "") -> str:
     elif not active_rule:
         record_lower = patient_record_text.lower()
         _rule_matched = False
+        
+        with _history_lock:
+            past_bot_msgs = [m.content for m in chat_history if isinstance(m, AIMessage)]
+            
         for rule in HIGH_RISK_RULES:
+            if any(rule["check_question"] in msg for msg in past_bot_msgs):
+                continue
+                
             has_condition = any(c in record_lower for c in rule["conditions"])
             has_trigger = any(t in cleaned_query for t in rule["triggers"])
             if has_condition and has_trigger:
@@ -629,7 +660,7 @@ def process_patient_query(raw_query: str, patient_record_text: str = "") -> str:
         filtered_context = filtered_context[:3000] + "\n...(đã cắt bớt để tiết kiệm token)"
     
     # Lấy dữ liệu Real-time từ SQL
-    live_services = fetch_live_services_from_mysql()
+    live_services, map_urls = fetch_live_services_from_mysql()
     # [GUARD] Giới hạn live_services để tránh tràn token
     if len(live_services) > 2000:
         live_services = live_services[:2000] + "\n...(đã cắt bớt)"
@@ -698,6 +729,13 @@ def process_patient_query(raw_query: str, patient_record_text: str = "") -> str:
             for step in decision.optimized_route:
                 route_text += f"\n{step.step_order}. **{step.service_name}** ({step.room})"
                 route_text += f"\n   ↓ *Lý do:* {step.reasoning}"
+                map_url = map_urls.get(step.service_id)
+                if map_url:
+                    route_text += f"\n  *Bản đồ:* {map_url}"
+            
+            if decision.is_ready_for_route and len(decision.optimized_route) > 0:
+                first_step = sorted(decision.optimized_route, key=lambda x: x.step_order)[0]
+                register_patient_to_queue(patient_id, first_step.service_id)
 
     except Exception as e:
         log_error(f"Loi xu ly cau truc: {e}")
@@ -779,7 +817,7 @@ if __name__ == "__main__":
                 continue
             
             if user_input.strip(): 
-                process_patient_query(user_input, patient_record_text)
+                process_patient_query(user_input, patient_record_text, current_patient_id)
         except KeyboardInterrupt: 
             break
         
