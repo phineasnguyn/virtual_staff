@@ -363,7 +363,7 @@ def _evict_expired_cache() -> None:
             _query_pending.pop(k, None)
 
 
-def process_patient_query(raw_query: str, patient_record_text: str = "", patient_id: str = "") -> str:
+def process_patient_query(raw_query: str, patient_record_text: str = "", patient_id: str = "") -> tuple[str, bool]:
     cache_key = re.sub(r'[^\w]', '', raw_query).strip().lower()
     now = time.time()
 
@@ -394,9 +394,9 @@ def process_patient_query(raw_query: str, patient_record_text: str = "", patient
         elapsed = now - _query_cache.get(cache_key, now)
         print(f"[XỬ LÝ TRÙNG LẶP] Đang chờ kết quả từ luồng 1 ({elapsed:.1f}s): '{raw_query[:50]}'")
         event.wait(timeout=355)
-        return result_holder[0] if result_holder else ""
+        return result_holder[0] if result_holder else ("", False)
     if should_skip:
-        return ""
+        return ("", False)
 
     # Dùng event/holder đã đăng ký trong khối lock phía trên
     event = event_new
@@ -420,11 +420,11 @@ def process_patient_query(raw_query: str, patient_record_text: str = "", patient
                 entry = _query_pending.pop(cache_key, None)
             if entry:
                 ev, holder = entry
-                holder.append(final_response)
+                holder.append((final_response, True))
                 ev.set()
         except Exception:
             pass
-        return final_response
+        return (final_response, True)
 
     pending_whisper = None
 
@@ -523,11 +523,11 @@ def process_patient_query(raw_query: str, patient_record_text: str = "", patient
                     entry = _query_pending.pop(cache_key, None)
                 if entry:
                     ev, holder = entry
-                    holder.append(final_response)
+                    holder.append((final_response, True))
                     ev.set()
             except Exception:
                 pass
-            return final_response
+            return (final_response, True)
         else:
             # [FAST PATH] Rủi ro bệnh nền đã loại trừ.
             # Tìm triệu chứng gốc từ lượt hỏi đầu tiên của bệnh nhân.
@@ -554,11 +554,11 @@ def process_patient_query(raw_query: str, patient_record_text: str = "", patient
                         entry = _query_pending.pop(cache_key, None)
                     if entry:
                         ev, holder = entry
-                        holder.append(symptom_followup)
+                        holder.append((symptom_followup, False))
                         ev.set()
                 except Exception:
                     pass
-                return symptom_followup
+                return (symptom_followup, False)
             else:
                 # Không khớp SYMPTOM_QUESTIONS → để LLM hỏi thêm (kèm whisper hướng dẫn)
                 pending_whisper = SystemMessage(
@@ -591,11 +591,11 @@ def process_patient_query(raw_query: str, patient_record_text: str = "", patient
                         entry = _query_pending.pop(cache_key, None)
                     if entry:
                         ev, holder = entry
-                        holder.append(final_response)
+                        holder.append((final_response, False))
                         ev.set()
                 except Exception:
                     pass
-                return final_response
+                return (final_response, False)
 
         # [LLM FALLBACK] Bệnh nhân có hồ sơ bệnh nền nhưng không khớp rule nào.
         # Inject whisper để LLM chủ động đọc hồ sơ và kiểm tra an toàn y khoa.
@@ -631,11 +631,11 @@ def process_patient_query(raw_query: str, patient_record_text: str = "", patient
                 entry = _query_pending.pop(cache_key, None)
             if entry:
                 ev, holder = entry
-                holder.append(quick_answer)
+                holder.append((quick_answer, False))
                 ev.set()
         except Exception:
             pass
-        return quick_answer
+        return (quick_answer, False)
     # ─────────────────────────────────────────────────────────────
 
     setup_qdrant()
@@ -683,7 +683,9 @@ def process_patient_query(raw_query: str, patient_record_text: str = "", patient
     if pending_whisper:
         messages.append(pending_whisper)
     
-    route_text = ""  # [GUARD] khai báo trước try để luôn tồn tại dù có exception
+    route_text = ""
+    is_routed = False
+    # [GUARD] khai báo trước try để luôn tồn tại dù có exception
     final_response = "Dạ, hệ thống đang bận. Cô/chú vui lòng qua Quầy số 1 ạ."  # default fallback
 
     try:
@@ -734,6 +736,7 @@ def process_patient_query(raw_query: str, patient_record_text: str = "", patient
                     route_text += f"\n  *Bản đồ:* {map_url}"
             
             if decision.is_ready_for_route and len(decision.optimized_route) > 0:
+                is_routed = True
                 first_step = sorted(decision.optimized_route, key=lambda x: x.step_order)[0]
                 register_patient_to_queue(patient_id, first_step.service_id)
 
@@ -756,12 +759,12 @@ def process_patient_query(raw_query: str, patient_record_text: str = "", patient
             entry = _query_pending.pop(cache_key, None)
         if entry:
             ev, holder = entry
-            holder.append(tts_response)
+            holder.append((tts_response, is_routed))
             ev.set()
     except Exception:
         pass
 
-    return tts_response
+    return (tts_response, is_routed)
 
 def reset_brain_memory():
     """Hàm dùng để xóa sạch trí nhớ LLM khi có bệnh nhân mới"""
@@ -817,7 +820,9 @@ if __name__ == "__main__":
                 continue
             
             if user_input.strip(): 
-                process_patient_query(user_input, patient_record_text, current_patient_id)
+                resp, routed = process_patient_query(user_input, patient_record_text, current_patient_id)
+                if routed:
+                    print("\n[HỆ THỐNG] Đã điều hướng xong. Sẵn sàng đón bệnh nhân tiếp theo!")
         except KeyboardInterrupt: 
             break
         

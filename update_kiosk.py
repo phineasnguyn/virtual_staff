@@ -190,7 +190,7 @@ class KioskBrainStream(llm.LLMStream):
             _fast = quick_route(self.user_text)
 
             try:
-                response = await asyncio.wait_for(
+                response, is_routed = await asyncio.wait_for(
                     asyncio.to_thread(
                         process_patient_query,
                         self.user_text,
@@ -198,6 +198,21 @@ class KioskBrainStream(llm.LLMStream):
                     ),
                     timeout=360,
                 )
+                
+                # RESET HỆ THỐNG NẾU ĐÃ ĐIỀU HƯỚNG
+                if is_routed:
+                    print(f"[RUN-{sid}] Đã điều hướng xong. Reset bộ nhớ cho bệnh nhân tiếp theo.")
+                    # Reset memory của Agent
+                    self.llm_instance.patient_id_verified = False
+                    self.llm_instance.set_record_context("")
+                    
+                    # Gọi hàm reset của backend core
+                    asyncio.create_task(asyncio.to_thread(reset_brain_memory))
+                    
+                    # Xóa lịch sử chat của LiveKit
+                    if self.chat_ctx and hasattr(self.chat_ctx, 'messages'):
+                        if isinstance(self.chat_ctx.messages, list):
+                            self.chat_ctx.messages.clear()
             except asyncio.TimeoutError:
                 print(f"[RUN-{sid}] LỖI: Hết thời gian chờ (Timeout)")
                 response = FALLBACK_RESPONSE
